@@ -1,0 +1,159 @@
+name: Jenkins laboratory demonstration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Jenkinsfile
+      - .github/workflows/jenkins-demo.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jenkins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare an authenticated temporary Jenkins controller
+        shell: bash
+        run: |
+          mkdir -p .lab/evidence
+          PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$PASSWORD"
+          echo "JENKINS_LAB_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+          cat > .lab/Dockerfile <<'DOCKER'
+          FROM jenkins/jenkins:2.580.1-jdk21
+          USER root
+          RUN apt-get update && apt-get install -y python3 python3-venv python3-pip git && apt-get clean && rm -rf /var/lib/apt/lists/*
+          USER jenkins
+          RUN jenkins-plugin-cli --plugins workflow-aggregator git
+          COPY init.groovy /usr/share/jenkins/ref/init.groovy.d/01-lab.groovy
+          DOCKER
+          cat > .lab/init.groovy <<'GROOVY'
+          import jenkins.model.Jenkins
+          import hudson.security.HudsonPrivateSecurityRealm
+          import hudson.security.FullControlOnceLoggedInAuthorizationStrategy
+          import hudson.plugins.git.GitSCM
+          import hudson.plugins.git.BranchSpec
+          import hudson.plugins.git.UserRemoteConfig
+          import org.jenkinsci.plugins.workflow.job.WorkflowJob
+          import org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition
+          def j = Jenkins.get()
+          def realm = new HudsonPrivateSecurityRealm(false)
+          realm.createAccount('lab-admin', System.getenv('JENKINS_LAB_PASSWORD'))
+          j.setSecurityRealm(realm)
+          def auth = new FullControlOnceLoggedInAuthorizationStrategy()
+          auth.setAllowAnonymousRead(false)
+          j.setAuthorizationStrategy(auth)
+          j.setNumExecutors(1)
+          j.setSlaveAgentPort(-1)
+          def scm = new GitSCM(
+              [new UserRemoteConfig('https://github.com/Divyaprasad-Sahu/Git_CICD_Demo.git', null, null, null)],
+              [new BranchSpec('*/main')], false, [], null, null, [])
+          def job = j.createProject(WorkflowJob, 'Git_CICD_Demo')
+          def definition = new CpsScmFlowDefinition(scm, 'Jenkinsfile')
+          definition.setLightweight(true)
+          job.setDefinition(definition)
+          job.save()
+          j.save()
+          GROOVY
+          docker build --progress plain -t experiment2-jenkins .lab
+      - name: Start Jenkins on runner loopback only
+        run: |
+          docker run -d --name experiment2-jenkins -p 127.0.0.1:8080:8080 \
+            -e JENKINS_LAB_PASSWORD \
+            -e JAVA_OPTS=-Djenkins.install.runSetupWizard=false \
+            experiment2-jenkins
+      - name: Run the real Jenkins pipeline and save its output
+        shell: python
+        run: |
+          import base64, http.cookiejar, json, os, pathlib, time, urllib.request
+          root = 'http://127.0.0.1:8080'
+          auth = base64.b64encode(('lab-admin:' + os.environ['JENKINS_LAB_PASSWORD']).encode()).decode()
+          client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          def request(path, data=None, headers=None):
+              h = {'Authorization': 'Basic ' + auth}
+              h.update(headers or {})
+              return client.open(urllib.request.Request(root + path, data=data, headers=h), timeout=15).read()
+          for attempt in range(90):
+              try:
+                  request('/api/json')
+                  break
+              except Exception:
+                  time.sleep(4)
+          else:
+              raise RuntimeError('Jenkins did not become ready')
+          crumb = json.loads(request('/crumbIssuer/api/json'))
+          request('/job/Git_CICD_Demo/build?delay=0sec', b'', {crumb['crumbRequestField']: crumb['crumb']})
+          for attempt in range(120):
+              try:
+                  build = json.loads(request('/job/Git_CICD_Demo/lastBuild/api/json'))
+                  if not build['building'] and build.get('result'):
+                      break
+              except Exception:
+                  pass
+              time.sleep(4)
+          else:
+              raise RuntimeError('Jenkins build did not finish')
+          evidence = pathlib.Path('.lab/evidence')
+          (evidence/'jenkins-build.json').write_text(json.dumps(build, indent=2))
+          console = request('/job/Git_CICD_Demo/lastBuild/consoleText').decode()
+          (evidence/'jenkins-console.txt').write_text(console)
+          print(console)
+          print('JENKINS BUILD RESULT:', build['result'])
+          if build['result'] != 'SUCCESS':
+              raise SystemExit(1)
+      - name: Install the browser for authentic Jenkins UI captures
+        if: always()
+        working-directory: .lab
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+      - name: Capture actual Jenkins pages without a cursor overlay
+        if: always()
+        working-directory: .lab
+        run: |
+          cat > capture.mjs <<'JS'
+          import { chromium } from 'playwright';
+          const browser = await chromium.launch({headless: true});
+          const context = await browser.newContext({viewport: {width: 1365, height: 900}});
+          const page = await context.newPage();
+          const base = 'http://127.0.0.1:8080';
+          await page.goto(base + '/login');
+          await page.locator('input[name="j_username"]').fill('lab-admin');
+          await page.locator('input[name="j_password"]').fill(process.env.JENKINS_LAB_PASSWORD);
+          await page.locator('button[type="submit"]').click();
+          await page.waitForURL(url => !url.pathname.includes('/login'));
+          await page.goto(base + '/');
+          await page.screenshot({path: 'evidence/jenkins-dashboard.png', fullPage: false});
+          await page.goto(base + '/job/Git_CICD_Demo/');
+          await page.screenshot({path: 'evidence/jenkins-job.png', fullPage: false});
+          await page.goto(base + '/job/Git_CICD_Demo/configure');
+          const definition = page.getByText('Definition', {exact:true});
+          if (await definition.count()) await definition.first().scrollIntoViewIfNeeded();
+          await page.screenshot({path: 'evidence/jenkins-configuration.png', fullPage: false});
+          await page.goto(base + '/job/Git_CICD_Demo/lastBuild/console');
+          await page.locator('body').press('Control+End');
+          await page.screenshot({path: 'evidence/jenkins-console.png', fullPage: false});
+          await page.goto(base + '/job/Git_CICD_Demo/lastBuild/');
+          await page.screenshot({path: 'evidence/jenkins-build.png', fullPage: false});
+          await browser.close();
+          JS
+          node capture.mjs
+      - name: Preserve screenshots and genuine Jenkins output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jenkins-evidence
+          path: .lab/evidence/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop the temporary Jenkins controller
+        if: always()
+        run: docker stop experiment2-jenkins || true
