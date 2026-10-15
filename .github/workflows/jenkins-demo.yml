@@ -138,8 +138,10 @@ jobs:
           const definition = page.getByText('Definition', {exact:true});
           if (await definition.count()) await definition.first().scrollIntoViewIfNeeded();
           await page.screenshot({path: 'evidence/jenkins-configuration.png', fullPage: false});
+          await page.evaluate(() => { for (const e of document.querySelectorAll('*')) if (e.scrollHeight > e.clientHeight + 50) e.scrollTop = e.scrollHeight; });
+          await page.screenshot({path: 'evidence/jenkins-configuration-path.png', fullPage: false});
           await page.goto(base + '/job/Git_CICD_Demo/lastBuild/console');
-          await page.locator('body').press('Control+End');
+          await page.evaluate(() => { for (const e of document.querySelectorAll('*')) if (e.scrollHeight > e.clientHeight + 50) e.scrollTop = e.scrollHeight; });
           await page.screenshot({path: 'evidence/jenkins-console.png', fullPage: false});
           await page.goto(base + '/job/Git_CICD_Demo/lastBuild/');
           await page.screenshot({path: 'evidence/jenkins-build.png', fullPage: false});
