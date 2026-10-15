@@ -4,3 +4,5 @@ def predict_label(value):
 
 if __name__ == "__main__":
     print("Prediction:", predict_label(0.8))
+def model_message():
+    return "MLOps model prediction system is ready"
